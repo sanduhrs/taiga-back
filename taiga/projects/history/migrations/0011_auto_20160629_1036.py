@@ -6,19 +6,114 @@ from django.db import migrations
 from taiga.projects.history.services import get_instance_from_key
 
 
-def forward_func(apps, schema_editor):
-    HistoryEntry = apps.get_model("history", "HistoryEntry")
-    db_alias = schema_editor.connection.alias
-    for entry in HistoryEntry.objects.using(db_alias).all().iterator():
-        instance = get_instance_from_key(entry.key)
-        if type(instance) == apps.get_model("projects", "Project"):
-            entry.project_id = instance.id
-        else:
-            entry.project_id = getattr(instance, 'project_id', None)
-            entry.save()
+FIX_PROJECT_ID_SQL = """
+    -- Creating a table containing all the existing object keys and the project ids
+    DROP TABLE IF EXISTS project_keys;
+    CREATE TABLE project_keys (
+    	key VARCHAR,
+    	project_id INTEGER
+    );
 
-    HistoryEntry.objects.using(db_alias).filter(project_id__isnull=True).delete()
+    DROP INDEX IF EXISTS project_keys_index;
+    CREATE INDEX project_keys_index
+      ON project_keys
+      USING btree
+      (key);
 
+    INSERT INTO project_keys
+    SELECT 'milestones.milestone:' || id, project_id
+    FROM milestones_milestone;
+
+    INSERT INTO project_keys
+    SELECT 'userstories_userstory.userstory:' || id, project_id
+    FROM userstories_userstory;
+
+    INSERT INTO project_keys
+    SELECT 'tasks.task:' || id, project_id
+    FROM tasks_task;
+
+    INSERT INTO project_keys
+    SELECT 'issues.issue:' || id, project_id
+    FROM issues_issue;
+
+    INSERT INTO project_keys
+    SELECT 'wiki.wiki_wikipage:' || id, project_id
+    FROM wiki_wikipage;
+
+    INSERT INTO project_keys
+    SELECT 'projects.project:' || id, id
+    FROM projects_project;
+
+    -- Create a table where we will insert all the history_historyentry content with its correct project_id
+    -- Elements without project_id won't be inserted
+    DROP TABLE IF EXISTS history_historyentry_correct;
+    CREATE TABLE history_historyentry_correct AS
+    SELECT
+    	history_historyentry.id ,
+    	history_historyentry.user,
+    	history_historyentry.created_at,
+    	history_historyentry.type,
+    	history_historyentry.is_snapshot,
+    	history_historyentry.key,
+    	history_historyentry.diff,
+    	history_historyentry.snapshot,
+    	history_historyentry.values,
+    	history_historyentry.comment,
+    	history_historyentry.comment_html,
+    	history_historyentry.delete_comment_date,
+    	history_historyentry.delete_comment_user,
+    	history_historyentry.is_hidden,
+    	history_historyentry.comment_versions,
+    	history_historyentry.edit_comment_date,
+    	project_keys.project_id
+    FROM history_historyentry
+    INNER JOIN project_keys
+    ON project_keys.key = history_historyentry.key;
+
+    -- Delete aux table
+    DROP TABLE IF EXISTS project_keys;
+
+    -- Adding the indexes and constraints necesary for the new table
+    DROP INDEX IF EXISTS history_historyentry_correct_b098ad43;
+    CREATE INDEX history_historyentry_correct_b098ad43
+      ON history_historyentry_correct
+      USING btree
+      (project_id);
+
+    DROP INDEX IF EXISTS history_historyentry_correct_id_like;
+    CREATE INDEX history_historyentry_correct_id_like
+      ON history_historyentry_correct
+      USING btree
+      (id COLLATE pg_catalog."default" varchar_pattern_ops);
+
+    DROP INDEX IF EXISTS history_historyentry_correct_key_d6d1c22063abd80_uniq;
+    CREATE INDEX history_historyentry_correct_key_d6d1c22063abd80_uniq
+      ON history_historyentry_correct
+      USING btree
+      (key COLLATE pg_catalog."default");
+
+    ALTER TABLE history_historyentry_correct
+      ADD CONSTRAINT history_historyentry_correct_pkey PRIMARY KEY(id);
+
+    ALTER TABLE history_historyentry_correct
+      ADD CONSTRAINT history_historyentry_correct_pid_9b008f70_fk_projects_pid FOREIGN KEY (project_id)
+          REFERENCES projects_project (id) MATCH SIMPLE
+          ON UPDATE NO ACTION ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED;
+
+    -- Clear pending notifications
+    DELETE FROM notifications_historychangenotification_history_entries;
+
+    -- Move the corrected history_historyentry table to the old one
+    ALTER TABLE notifications_historychangenotification_history_entries DROP CONSTRAINT noti_historyentry_id_b766793f71779aa_fk_history_historyentry_id;
+
+    DROP TABLE history_historyentry;
+    ALTER TABLE "history_historyentry_correct" RENAME to "history_historyentry";
+
+    ALTER TABLE notifications_historychangenotification_history_entries
+       ADD CONSTRAINT noti_historyentry_id_b766793f71779aa_fk_history_historyentry_id FOREIGN KEY (historyentry_id)
+    	REFERENCES history_historyentry (id) MATCH SIMPLE
+    	ON UPDATE NO ACTION ON DELETE NO ACTION DEFERRABLE INITIALLY DEFERRED;
+"""
 
 class Migration(migrations.Migration):
 
@@ -27,5 +122,5 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(forward_func, atomic=False),
+        migrations.RunSQL(FIX_PROJECT_ID_SQL),
     ]
